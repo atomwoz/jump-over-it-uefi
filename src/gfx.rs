@@ -1,64 +1,94 @@
-use uefi::proto::console::gop::*;
+use alloc::vec;
+use alloc::vec::Vec;
+use embedded_graphics::{pixelcolor::Rgb888, prelude::*};
+use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 
-pub type Color = (u8, u8, u8);
+pub struct UefiDrawTarget<'a> {
+    gop: &'a mut GraphicsOutput,
+    buffer: Vec<u8>,
+    width: usize,
+    height: usize,
+    stride: usize,
+}
 
-pub fn draw_rect(
-    gop: &mut GraphicsOutput,
-    dim: (usize, usize),
-    pos: (usize, usize),
-    line_color: Color,
-    fill_color: Color,
-    line_thickness: usize,
-) {
-    for y in pos.1..pos.1 + dim.1 {
-        for x in pos.0..pos.0 + dim.0 {
-            let is_border = x < pos.0 + line_thickness
-                || x >= pos.0 + dim.0 - line_thickness
-                || y < pos.1 + line_thickness
-                || y >= pos.1 + dim.1 - line_thickness;
+impl<'a> UefiDrawTarget<'a> {
+    pub fn new(gop: &'a mut GraphicsOutput) -> Self {
+        let mode = gop.current_mode_info();
+        let (width, height) = mode.resolution();
+        let stride = mode.stride();
 
-            set_pixel_rgb(gop, (x, y), if is_border { line_color } else { fill_color });
+        let buffer_size = stride * height * 4;
+        let buffer = vec![0; buffer_size];
+
+        Self {
+            gop,
+            buffer,
+            width,
+            height,
+            stride,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        let mut fb = self.gop.frame_buffer();
+
+        unsafe {
+            let src = self.buffer.as_ptr();
+            let dst = fb.as_mut_ptr();
+            let len = self.buffer.len();
+            core::ptr::copy_nonoverlapping(src, dst, len);
         }
     }
 }
 
-pub fn clear(gop: &mut GraphicsOutput, color: Color) {
-    let (width, height) = gop.current_mode_info().resolution();
-    for y in 0..height {
-        for x in 0..width {
-            set_pixel_rgb(gop, (x, y), color);
-        }
+impl OriginDimensions for UefiDrawTarget<'_> {
+    fn size(&self) -> Size {
+        Size::new(self.width as u32, self.height as u32)
     }
 }
 
-pub fn set_pixel_rgb(gop: &mut GraphicsOutput, pos: (usize, usize), color: Color) {
-    let mode = gop.current_mode_info();
-    let (width, height) = mode.resolution();
+impl DrawTarget for UefiDrawTarget<'_> {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
 
-    if pos.0 >= width || pos.1 >= height {
-        return;
-    }
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        let pixel_format = self.gop.current_mode_info().pixel_format();
 
-    let pixel_format = mode.pixel_format();
-    let stride = mode.stride(); // pixels per scanline
-    let mut fb = gop.frame_buffer();
+        for Pixel(point, color) in pixels.into_iter() {
+            if point.x < 0 || point.y < 0 {
+                continue;
+            }
+            let x = point.x as usize;
+            let y = point.y as usize;
 
-    let bytes_per_pixel = 4;
-    let index = (pos.1 * stride + pos.0) * bytes_per_pixel;
+            if x >= self.width || y >= self.height {
+                continue;
+            }
 
-    match pixel_format {
-        PixelFormat::Rgb => unsafe {
-            fb.write_byte(index, color.0);
-            fb.write_byte(index + 1, color.1);
-            fb.write_byte(index + 2, color.2);
-            fb.write_byte(index + 3, 0);
-        },
-        PixelFormat::Bgr => unsafe {
-            fb.write_byte(index, color.2);
-            fb.write_byte(index + 1, color.1);
-            fb.write_byte(index + 2, color.0);
-            fb.write_byte(index + 3, 0);
-        },
-        _ => {}
+            let index = (y * self.stride + x) * 4;
+
+            match pixel_format {
+                PixelFormat::Rgb => {
+                    self.buffer[index] = color.r();
+                    self.buffer[index + 1] = color.g();
+                    self.buffer[index + 2] = color.b();
+                }
+                PixelFormat::Bgr => {
+                    self.buffer[index] = color.b();
+                    self.buffer[index + 1] = color.g();
+                    self.buffer[index + 2] = color.r();
+                }
+                _ => {
+                    // Fallback or other formats
+                    self.buffer[index] = color.r();
+                    self.buffer[index + 1] = color.g();
+                    self.buffer[index + 2] = color.b();
+                }
+            }
+        }
+        Ok(())
     }
 }
